@@ -1,272 +1,182 @@
-# PHOBOS — High‑Performance On‑Chain Price Graph & MEV Research (Osmosis)
+# Solana Raydium MEV Sandwicher (Rust + Jito)
 
-> **Scope:** This repository documents a multi‑month research and engineering effort to design, build, and operate a *low‑latency, on‑chain price graph* and MEV experimentation stack on **Osmosis**.  
-> **Focus:** price discovery quality, latency, correctness under real chain conditions, and scalable ingestion — not production trading claims.
+This repository contains a **research‑grade Solana MEV bot** that targets
+Raydium AMM pools and constructs **front‑run / back‑run bundles** around large
+swaps, with routing through the **Jito block engine**.
 
----
+The design is intentionally modular:
 
-## Executive Summary
+- Pure‑Rust core (Tokio + Axum)  
+- Live Raydium pool discovery & state tracking  
+- On‑chain volatility (σ) & impact estimation per pool  
+- Simple x·y = k sandwich simulator  
+- Jito bundle construction with risk caps & accounting logs  
 
-PHOBOS is a self‑hosted, locally‑validated market‑data and execution research platform designed to answer one core question:
-
-> *Can we construct a high‑fidelity, real‑time price graph from raw on‑chain state that is fast enough and accurate enough to support advanced arbitrage and MEV strategies?*
-
-The answer was **yes — from a systems and data‑quality perspective**.
-
-Key outcomes:
-- Built a **real‑time price graph** spanning **CL (Concentrated Liquidity)** and **GAMM (Balancer)** pools
-- Achieved **sub‑200 ms GAMM refresh cycles** and **~500–600 ms CL refresh cycles** on a local node
-- Implemented **sigma‑aware pricing**, oracle gating, and liquidity‑weighted edges
-- Proved correctness via **truth harnesses** against live chain state
-- Designed the system to scale horizontally and port to **Solana / Jito**‑style environments
-
-This repo intentionally emphasizes **architecture, data quality, and performance**, not financial results.
+The code is written to be a realistic stepping‑stone toward **Shredstream‑based
+atomic sandwiching**, while remaining safe to run in “research” mode today.
 
 ---
 
-## Why Osmosis?
+## High‑level Architecture
 
-Osmosis offered a uniquely demanding environment:
-- Two fundamentally different AMM models (GAMM vs CL)
-- High on‑chain activity and arbitrage competition
-- Rich gRPC + LCD surface area
-- Complex tick‑based liquidity math
+At a high level, the bot does:
 
-If a price graph can remain correct and performant here, it can be adapted anywhere.
+1. **Pool discovery & tracking**
+   - Fetches Raydium pool metadata from the public SDK/liquidity API.
+   - Maintains a bounded map of tracked pools (e.g. up to `MAX_POOLS`).
+   - Periodically refreshes vault balances via Solana RPC.
+   - Computes per‑pool price, raw σ, and a rolling σ window.
 
----
+2. **Opportunity detection via webhook**
+   - Exposes a small Axum HTTP server that accepts **transaction webhooks**
+     (Helius‑style JSON payloads).
+   - Filters for Raydium swaps that match supported pools (e.g. SOL/USDC).
+   - Extracts opportunity size, direction, and basic metadata.
 
-## System Architecture (High Level)
+3. **Local RPC enrichment**
+   - For each candidate, the bot queries a Solana RPC node
+     (typically a local validator with transaction history enabled) to:
+     - Fetch the raw `VersionedTransaction`.
+     - Decode instructions and accounts.
+     - Ensure the opportunity can be included in a Jito bundle.
 
-```
-                ┌────────────────────────┐
-                │  Local Osmosis Node    │
-                │  (validator / full)   │
-                └──────────┬────────────┘
-                           │
-                ┌──────────▼────────────┐
-                │  Price Graph Daemon   │
-                │  (Rust, async)        │
-                │                        │
-                │  • CL live scanner     │
-                │  • GAMM fast poller    │
-                │  • Sigma + oracle      │
-                │  • Liquidity math      │
-                └──────────┬────────────┘
-                           │ gRPC
-                ┌──────────▼────────────┐
-                │   In‑proc Clients     │
-                │  • Arbitrage engine   │
-                │  • Front‑run engine   │
-                │  • Metrics / debug    │
-                └───────────────────────┘
-```
+4. **Sandwich simulation & gating**
+   - Uses a simple x·y = k model to simulate:
+     - Our front‑run (SOL → token).
+     - Opportunity trade at new reserves.
+     - Our back‑run (token → SOL).
+   - Computes:
+     - Expected **gross profit** in SOL.
+     - Expected **net profit** in SOL (after a configurable Jito tip).
+     - Opportunity price impact and pool σ.
+   - Applies multiple safety filters, for example:
+     - Minimum opportunity size.
+     - Maximum allowed price impact.
+     - Maximum allowed σ.
+     - Minimum **net profit** in SOL.
+     - Per‑session caps on total notional and total Jito tips.
 
-All market data is derived **directly from the local node** — no third‑party RPCs.
+5. **Bundle construction & submission**
+   - Builds three real Solana transactions:
+     1. **Front‑run swap** (MEV wallet SOL/wSOL → SPL token, via Raydium).
+     2. **Back‑run swap** (SPL token → SOL/wSOL).
+     3. **Tip transfer** (MEV wallet → Jito tip account).
+   - Optionally includes the **opportunity transaction** fetched from RPC.
+   - Encodes them as a Jito bundle and POSTs to the block engine HTTP API
+     when in `Live` mode.
 
----
+6. **Accounting & observability**
+   - Emits structured logs for:
+     - Every candidate (`[CANDIDATE]`).
+     - Every gating decision (`[SKIP]` with reason flags).
+     - Every live bundle attempt (`[JITO LIVE ATTEMPT]`).
+     - Every successful submission (`[JITO LIVE SENT]`).
+     - A dedicated `[ACCT]` line with all fields needed for PnL/tax export.
+   - Designed so a separate process can tail logs and compute:
+     - Win rate.
+     - Realized/realizable PnL in SOL and USD.
+     - Tip spend vs. gross MEV.
 
-## Price Graph Design
-
-### Core Concepts
-
-Each edge in the graph represents a *directional executable price*:
-
-```text
-(pool_id, denom_in → denom_out)
-  mid_price
-  fair_price (oracle)
-  sigma (volatility)
-  virtual_liquidity (USD)
-  pool_type (CL | GAMM)
-```
-
-The graph is **directional** and **pool‑aware** — edges are never blended across pools.
-
----
-
-## CL (Concentrated Liquidity) Pipeline
-
-### Live CL Scanner
-
-- Pulls pool state via **Osmosis gRPC**
-- Reconstructs:
-  - current tick
-  - tick spacing
-  - prefix liquidity
-  - net liquidity above / below tick
-
-### Key Challenges Solved
-
-- Correctly parsing **sdk.Dec** values (including scientific notation)
-- Avoiding integer overflow while preserving precision
-- Handling asymmetric liquidity nets
-- Matching gRPC math with on‑chain truth
-
-### Performance
-
-- ~500–600 ms average full‑list scan
-- gRPC channel pooling + parallel net queries
-- Cycle latency exposed via Prometheus histogram:
-
-```
-cl_fast_cycle_seconds_bucket
-cl_fast_cycle_seconds_sum
-cl_fast_cycle_seconds_count
-```
+> **Note:** This repository never commits real keys, wallet addresses, or
+> infrastructure details. All sensitive configuration is injected via
+> environment variables at runtime.
 
 ---
 
-## GAMM (Balancer) Pipeline
+## Components
 
-### Fast List‑Based Poller
+### 1. Core binary (`oracle`)
 
-- Polls only a **curated pool list** (TVL‑filtered)
-- Interval‑based (milliseconds)
-- Concurrency‑bounded
-- Reloads pool list on file change
+The main binary:
 
-### Performance
+- Starts an Axum HTTP server to receive webhooks.
+- Spawns a pool‑tracking task to keep Raydium state fresh.
+- Manages shared state (`PoolState`, `PoolConfig`, Jito config + per‑session
+  counters).
+- Coordinates:
+  - RPC client (non‑blocking Solana RPC).
+  - HTTP client (Raydium API, Jito block engine).
+  - Pyth/Hermes price feed for SOL/USD.
 
-- ~130 ms average cycle across ~90 pools
-- Stable under sustained load
-- Metric:
+### 2. Pool & volatility tracking
 
-```
-gamm_fast_cycle_seconds_bucket
-```
+For each tracked pool, the bot maintains:
 
----
+- **Reserves**: base/quote vault balances.
+- **Pool price** (base → quote).
+- A rolling history window of price changes.
+- **σ (sigma)** computed from the rolling window and stored per pool.
 
-## Oracle & Sigma Handling
+This allows it to:
 
-Each edge can be:
-- **Oracle‑backed** (fair_price + sigma)
-- **Oracle‑optional** (mid‑only, gated)
+- Ignore illiquid or “dead” pools.
+- Prefer pools whose volatility profile matches a configurable strategy.
 
-### Sigma Usage
+### 3. Sandwich simulator
 
-- Sigma used for:
-  - risk‑aware sizing
-  - edge scoring
-  - bait detection (front‑run path)
+A self‑contained Rust module:
 
-- Zero‑sigma edges are explicitly handled (floored, never divided by zero)
+- Implements x·y = k simulation with fees.
+- Provides:
+  - `simulate_swap_xyk` for a single swap.
+  - `simulate_sandwich_sol_in` for front + opportunity + back sequence.
+- Returns a `SandwichResult` struct with:
+  - `profit_sol`
+  - `front_token_out`
+  - `opportunity_effective_price`
+  - `opportunity_price_impact`
+  - final reserves (for debugging).
 
----
+This can be unit‑tested in isolation and reused for other AMMs.
 
-## Historical Evolution
+### 4. Jito integration
 
-### Phase 1 — Tickmap Discovery
+A small configuration layer:
 
-- Three‑tier tickmap system:
-  1. bitmap locator
-  2. master index
-  3. trimmed execution map
+- `JitoMode` enum: `Off`, `DryRun`, `Live`.
+- `JitoConfig` struct:
+  - Max tip per bundle.
+  - Aggregate tip cap per process.
+  - Aggregate **front notional** cap per process.
+  - Minimum net profit in SOL for a bundle to be considered.
+  - Block engine endpoint URL.
 
-Goal: correctness and full coverage.
+When `JitoMode::DryRun`:
 
-### Phase 2 — Truth Harness
+- The bot still does full planning and simulation, but **does not** submit
+  bundles; it logs what it *would* have done for calibration.
 
-- Side‑by‑side comparison of:
-  - reconstructed reserves
-  - implied prices
-  - on‑chain execution results
+When `JitoMode::Live`:
 
-This phase eliminated multiple silent math bugs.
-
-### Phase 3 — Live Scanners
-
-- Replaced file‑based watchers with **live gRPC scanners**
-- Introduced:
-  - channel pools
-  - parallel direction scans
-  - deterministic cycle timing
-
-### Phase 4 — Unified Price Graph
-
-- Single gRPC service exporting:
-  - ListEdges
-  - Direct price queries
-  - Pool‑scoped snapshots
+- It actually serializes and submits bundles to the Jito block engine.
 
 ---
 
-## Arbitrage Engine (Research)
+## Configuration (sanitized)
 
-- Linear USD‑anchored cycles (USDC → X → USDC)
-- Pool‑aware (never mixes pools incorrectly)
-- Slippage + impact‑aware sizing
-- Wallet‑safe routing
+All sensitive details are **environment‑driven**. Typical env vars:
 
-> This engine was used primarily as a **data‑quality validator**.
+```bash
+# Core RPC & price feeds
+export RPC_URL="https://your-rpc-or-local-validator"
+export PYTH_HERMES_URL="https://hermes.pyth.network"
+export PYTH_SOL_USD_ID="0x..."
 
----
+# Raydium pool source
+export RAYDIUM_LIQUIDITY_URL="https://api.raydium.io/v2/sdk/liquidity/mainnet.json"
 
-## Front‑Run Engine (Research)
+# Jito
+export JITO_BLOCK_ENGINE_URL="https://<region>.block-engine.jito.wtf/api/v1/bundles"
+export JITO_MODE="DryRun"    # Off | DryRun | Live
 
-- Mempool ingestion via Tendermint WebSocket
-- Pool‑specific edge lookup (never global quotes)
-- Pre‑ask revalidation
-- Oracle‑aware bait veto
+# MEV wallet (never committed to git)
+export MEV_KEYPAIR_PATH="/path/to/mev-keypair.json"
 
-Again: **focus was correctness and timing**, not production claims.
+# MEV token accounts (examples; use your own ATAs)
+export MEV_WSOL_ATA="<WSOL ATA for your MEV wallet>"
+export MEV_USDC_ATA="<USDC ATA for your MEV wallet>"
 
----
-
-## Observability
-
-Everything is measurable:
-
-- Refresh latency (CL & GAMM)
-- Edge counts
-- Oracle freshness
-- Cache age
-- Execution veto reasons
-
-Prometheus endpoint:
-```
-http://localhost:9898/metrics
-```
-
----
-
-## Why This Matters for Jito / Solana
-
-PHOBOS demonstrates:
-
-- Building **low‑latency market structure** from raw chain state
-- Designing **pool‑aware, directional price graphs**
-- Handling **high‑frequency data correctness** under adversarial conditions
-- Architecting systems that cleanly port to:
-  - Solana validators
-  - Shredstream / block‑engine environments
-
-The Osmosis work serves as a **laboratory** — not an endpoint.
-
----
-
-## What This Repo Is (and Is Not)
-
-✅ Systems engineering
-✅ Market‑data correctness
-✅ Performance instrumentation
-
-❌ Marketing claims
-❌ Profit screenshots
-❌ Turn‑key trading advice
-
----
-
-## Closing
-
-PHOBOS is best understood as a **market‑data and MEV research platform** that happens to include arbitrage and front‑run engines as *validation tools*.
-
-The price graph — its latency, correctness, and observability — is the real artifact.
-
----
-
-*Happy to discuss architecture, performance trade‑offs, or how this maps directly onto Jito / Solana block‑engine workflows.*
-
-# solana
-Phobos-Solana Project
+# Risk & capital allocation (tuned offline)
+export JITO_MAX_TIP_SOL="..."
+export JITO_SESSION_TIP_CAP_SOL="..."
+export JITO_SESSION_NOTIONAL_CAP_SOL="..."
