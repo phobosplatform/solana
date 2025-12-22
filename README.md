@@ -1,182 +1,149 @@
-# Solana Raydium MEV Sandwicher (Rust + Jito)
+# Solana Price-Based Trading Stack (Yellowstone gRPC + Metis + Local Node)
 
-This repository contains a **research‑grade Solana MEV bot** that targets
-Raydium AMM pools and constructs **front‑run / back‑run bundles** around large
-swaps, with routing through the **Jito block engine**.
+> ⚠️ DO NOT COMMIT: private keys, API keys, auth headers, IPs/hostnames, or wallet addresses.
+> Keep all secrets in shell exports / dotenv that is **gitignored**.
 
-The design is intentionally modular:
+This repo is a **price/quote–based trading system** for Solana:
+- **No sandwiching**
+- **No backrunning / victim-tx dependence**
+- **No mempool/shredstream requirements**
+- Only **self-initiated trades** driven by periodic scanning + risk controls
 
-- Pure‑Rust core (Tokio + Axum)  
-- Live Raydium pool discovery & state tracking  
-- On‑chain volatility (σ) & impact estimation per pool  
-- Simple x·y = k sandwich simulator  
-- Jito bundle construction with risk caps & accounting logs  
-
-The code is written to be a realistic stepping‑stone toward **Shredstream‑based
-atomic sandwiching**, while remaining safe to run in “research” mode today.
-
----
-
-## High‑level Architecture
-
-At a high level, the bot does:
-
-1. **Pool discovery & tracking**
-   - Fetches Raydium pool metadata from the public SDK/liquidity API.
-   - Maintains a bounded map of tracked pools (e.g. up to `MAX_POOLS`).
-   - Periodically refreshes vault balances via Solana RPC.
-   - Computes per‑pool price, raw σ, and a rolling σ window.
-
-2. **Opportunity detection via webhook**
-   - Exposes a small Axum HTTP server that accepts **transaction webhooks**
-     (Helius‑style JSON payloads).
-   - Filters for Raydium swaps that match supported pools (e.g. SOL/USDC).
-   - Extracts opportunity size, direction, and basic metadata.
-
-3. **Local RPC enrichment**
-   - For each candidate, the bot queries a Solana RPC node
-     (typically a local validator with transaction history enabled) to:
-     - Fetch the raw `VersionedTransaction`.
-     - Decode instructions and accounts.
-     - Ensure the opportunity can be included in a Jito bundle.
-
-4. **Sandwich simulation & gating**
-   - Uses a simple x·y = k model to simulate:
-     - Our front‑run (SOL → token).
-     - Opportunity trade at new reserves.
-     - Our back‑run (token → SOL).
-   - Computes:
-     - Expected **gross profit** in SOL.
-     - Expected **net profit** in SOL (after a configurable Jito tip).
-     - Opportunity price impact and pool σ.
-   - Applies multiple safety filters, for example:
-     - Minimum opportunity size.
-     - Maximum allowed price impact.
-     - Maximum allowed σ.
-     - Minimum **net profit** in SOL.
-     - Per‑session caps on total notional and total Jito tips.
-
-5. **Bundle construction & submission**
-   - Builds three real Solana transactions:
-     1. **Front‑run swap** (MEV wallet SOL/wSOL → SPL token, via Raydium).
-     2. **Back‑run swap** (SPL token → SOL/wSOL).
-     3. **Tip transfer** (MEV wallet → Jito tip account).
-   - Optionally includes the **opportunity transaction** fetched from RPC.
-   - Encodes them as a Jito bundle and POSTs to the block engine HTTP API
-     when in `Live` mode.
-
-6. **Accounting & observability**
-   - Emits structured logs for:
-     - Every candidate (`[CANDIDATE]`).
-     - Every gating decision (`[SKIP]` with reason flags).
-     - Every live bundle attempt (`[JITO LIVE ATTEMPT]`).
-     - Every successful submission (`[JITO LIVE SENT]`).
-     - A dedicated `[ACCT]` line with all fields needed for PnL/tax export.
-   - Designed so a separate process can tail logs and compute:
-     - Win rate.
-     - Realized/realizable PnL in SOL and USD.
-     - Tip spend vs. gross MEV.
-
-> **Note:** This repository never commits real keys, wallet addresses, or
-> infrastructure details. All sensitive configuration is injected via
-> environment variables at runtime.
+The system is designed to run on an Ubuntu bare-metal server with:
+- A **local Solana RPC node** (Agave / solana-validator build)
+- **Yellowstone gRPC (Geyser plugin)** for low-latency account/tx/slot streaming
+- **Jupiter Metis (self-hosted)** as the routing/quote engine (avoids hosted Jupiter rate limits)
+- Optional: **Jito bundles** for atomic multi-tx execution + inclusion priority
+- Optional: **Bloxroute Enterprise** for additional network connectivity and/or market-signal feeds
 
 ---
 
-## Components
+## 1) What “Metis” is (and isn’t)
 
-### 1. Core binary (`oracle`)
+Metis is a routing engine used to compute best paths across Solana DEX liquidity and build swap transactions based on quotes. Self-hosting Metis requires a **Binary Key**, which (as of the current Jupiter guidance) is gated by **10,000 staked JUP** per instance. :contentReference[oaicite:0]{index=0}
 
-The main binary:
+Important operational point:
+- **Metis produces quotes and swap transaction payloads**
+- You still **sign locally** with your wallet and **send** via RPC (or bundle via Jito) :contentReference[oaicite:1]{index=1}
 
-- Starts an Axum HTTP server to receive webhooks.
-- Spawns a pool‑tracking task to keep Raydium state fresh.
-- Manages shared state (`PoolState`, `PoolConfig`, Jito config + per‑session
-  counters).
-- Coordinates:
-  - RPC client (non‑blocking Solana RPC).
-  - HTTP client (Raydium API, Jito block engine).
-  - Pyth/Hermes price feed for SOL/USD.
-
-### 2. Pool & volatility tracking
-
-For each tracked pool, the bot maintains:
-
-- **Reserves**: base/quote vault balances.
-- **Pool price** (base → quote).
-- A rolling history window of price changes.
-- **σ (sigma)** computed from the rolling window and stored per pool.
-
-This allows it to:
-
-- Ignore illiquid or “dead” pools.
-- Prefer pools whose volatility profile matches a configurable strategy.
-
-### 3. Sandwich simulator
-
-A self‑contained Rust module:
-
-- Implements x·y = k simulation with fees.
-- Provides:
-  - `simulate_swap_xyk` for a single swap.
-  - `simulate_sandwich_sol_in` for front + opportunity + back sequence.
-- Returns a `SandwichResult` struct with:
-  - `profit_sol`
-  - `front_token_out`
-  - `opportunity_effective_price`
-  - `opportunity_price_impact`
-  - final reserves (for debugging).
-
-This can be unit‑tested in isolation and reused for other AMMs.
-
-### 4. Jito integration
-
-A small configuration layer:
-
-- `JitoMode` enum: `Off`, `DryRun`, `Live`.
-- `JitoConfig` struct:
-  - Max tip per bundle.
-  - Aggregate tip cap per process.
-  - Aggregate **front notional** cap per process.
-  - Minimum net profit in SOL for a bundle to be considered.
-  - Block engine endpoint URL.
-
-When `JitoMode::DryRun`:
-
-- The bot still does full planning and simulation, but **does not** submit
-  bundles; it logs what it *would* have done for calibration.
-
-When `JitoMode::Live`:
-
-- It actually serializes and submits bundles to the Jito block engine.
+That means your trading key never needs to live inside Metis itself.
 
 ---
 
-## Configuration (sanitized)
+## 2) Why Yellowstone gRPC exists in this stack
 
-All sensitive details are **environment‑driven**. Typical env vars:
+Yellowstone gRPC is a **Solana Geyser plugin** that streams **accounts/transactions/blocks/slots** with lower latency and lower “RPC polling load” than constantly re-fetching everything by HTTP RPC. :contentReference[oaicite:2]{index=2}
 
-```bash
-# Core RPC & price feeds
-export RPC_URL="https://your-rpc-or-local-validator"
-export PYTH_HERMES_URL="https://hermes.pyth.network"
-export PYTH_SOL_USD_ID="0x..."
+In a scanning-based trader, it’s used to:
+- Keep local state fresh (vault balances, pool state, token account changes)
+- Reduce heavy periodic `getMultipleAccounts` loops
+- Trigger “re-scan now” when a watched account changes (optional)
 
-# Raydium pool source
-export RAYDIUM_LIQUIDITY_URL="https://api.raydium.io/v2/sdk/liquidity/mainnet.json"
+---
 
-# Jito
-export JITO_BLOCK_ENGINE_URL="https://<region>.block-engine.jito.wtf/api/v1/bundles"
-export JITO_MODE="DryRun"    # Off | DryRun | Live
+## 3) High-level architecture
+         ┌──────────────────────────┐
+         │   Agave local node RPC   │
+         │   (simulate + send tx)   │
+         └───────────┬──────────────┘
+                     │
+             (Geyser plugin)
+                     │
+         ┌───────────▼──────────────┐
+         │     Yellowstone gRPC      │
+         │  accounts / tx / slots    │
+         └───────────┬──────────────┘
+                     │
+         ┌───────────▼──────────────┐
+         │     Metis (self-hosted)   │
+         │   quotes + route building │
+         └───────────┬──────────────┘
+                     │
+         ┌───────────▼──────────────┐
+         │      Rust trader bot      │
+         │ scan → risk-gate → sim →  │
+         │ sign → send / bundle      │
+         └───────────┬──────────────┘
+                     │
+    ┌────────────────▼───────────────┐
+    │ Optional: Jito block engine     │
+    │ bundles for atomic multi-tx     │
+    └────────────────────────────────┘
 
-# MEV wallet (never committed to git)
-export MEV_KEYPAIR_PATH="/path/to/mev-keypair.json"
+Optional sidecar:
 
-# MEV token accounts (examples; use your own ATAs)
-export MEV_WSOL_ATA="<WSOL ATA for your MEV wallet>"
-export MEV_USDC_ATA="<USDC ATA for your MEV wallet>"
+Bloxroute gateway / WS feeds (signals / connectivity)
 
-# Risk & capital allocation (tuned offline)
-export JITO_MAX_TIP_SOL="..."
-export JITO_SESSION_TIP_CAP_SOL="..."
-export JITO_SESSION_NOTIONAL_CAP_SOL="..."
+
+---
+
+## 4) Repo layout (current)
+
+Typical layout in this crate:
+
+- `src/bin/arb.rs`
+  - Main trading binary (name historical; functionally this is the price/quote trader)
+- `src/bin/fund_usdc.rs`
+  - Utility to fund USDC using Jupiter swap API (or later: Metis local)
+- `src/bin/fund_jup.rs`
+  - Utility to buy JUP (for staking / tooling workflows)
+
+You can add additional scanning binaries later as separate `src/bin/*.rs` programs without touching the core runtime.
+
+---
+
+**DELIBERATELY SKIPPING 5 and 6.  Too sensitive for Public forums.
+**
+
+7) Operating model: scanning-based price/quote trading
+
+Instead of reacting to “pending” transactions, this stack finds opportunities by repeatedly answering:
+
+What is the best executable route right now? (Metis quote)
+
+What’s the expected output after slippage + fees + tips?
+
+Does a risk-bounded trade clear the threshold?
+
+Simulate
+
+Sign
+
+Send (RPC or Jito bundle)
+
+Metis provides both the quote and the ability to build the swap transaction payload; you sign & send. 
+Jupiter Developers
++1
+
+Strategy modules (planned)
+
+Run them as separate binaries or subcommands:
+
+Cross-venue price arb (spatial): same pair, different venues
+
+Triangular cycles: A→B→C→A using a token graph (petgraph)
+
+Oracle-relative: pool price deviates from oracle (only where you can hedge/exit safely)
+
+LST relative value: correlated assets, z-score based
+
+8) Logging / observability
+
+Recommended log tags (examples):
+
+[SCAN] scanning iteration start/end, how many pairs evaluated
+
+[QUOTE] quote received (route labels, impact, in/out)
+
+[SKIP] why a candidate was rejected (impact too high, profit too low, stale state, etc.)
+
+[SIM] simulation summary / failure reason
+
+[SEND] signed tx signature or bundle id
+
+[ACCT] accounting line: gross, fees, tip, net, ROI
+
+Example grep:
+
+tail -F arb.log | grep --line-buffered -E \
+'SCAN|QUOTE|CANDIDATE|SKIP|SIM|SEND|ACCT|ERROR|WARN|JITO|BLOX'
